@@ -1,0 +1,24 @@
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+node_modules/
+dist/
+.vite/
+coverage/
+frontend/.env
+backend/.env
+
+# IDE / 编辑器
+.idea/
+.vscode/
+.DS_Store
+
+# 运行时产物与日志
+*.log
+*.db
+backend/data/
+frontend/.npm-cache/
+*.tsbuildinfo
+
