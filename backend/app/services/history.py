@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from fastapi import HTTPE
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-xception
+
+from fastapi import HTTPException
 
 from app.models import (
     AgentResponse,

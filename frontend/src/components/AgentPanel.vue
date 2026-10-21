@@ -102,6 +102,11 @@ async function submit() {
           fallback: false
         }
       },
+      onStage(data) {
+        if (data.label) {
+          store.messages[assistantIndex].content = `${data.label}……`
+        }
+      },
       onDelta(text) {
         streamedAnswer += text
         store.messages[assistantIndex].content = streamedAnswer

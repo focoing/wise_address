@@ -51,6 +51,15 @@ class PoiItem(BaseModel):
     location: str = ""
 
 
+class PointSample(BaseModel):
+    label: str = ""
+    lng: float
+    lat: float
+    radius: int
+    total: int
+    byCategory: dict[str, int] = Field(default_factory=dict)
+
+
 class PoiSummary(BaseModel):
     total: int
     byCategory: dict[str, int]
@@ -58,6 +67,7 @@ class PoiSummary(BaseModel):
     radius: int
     estimated: bool = False
     competitorCount: int = 0
+    samplePoints: list[PointSample] = Field(default_factory=list)
 
 
 class AlternativeRecommendation(BaseModel):
@@ -80,6 +90,15 @@ class AnalysisResponse(BaseModel):
     evidence: list[str]
     estimatedFields: list[str]
     alternatives: list[AlternativeRecommendation] = Field(default_factory=list)
+    moduleFindings: dict[str, Any] | None = None
+
+
+class AgentTrace(BaseModel):
+    dataAgent: str = "fallback"  # ok | fallback
+    analyst: str = "fallback"  # ok | fallback
+    reviewer: str = "skipped"  # ok | revise | skipped
+    retrievalNotes: str = ""
+    reviewerNotes: str = ""
 
 
 class AgentResponse(BaseModel):
@@ -89,6 +108,7 @@ class AgentResponse(BaseModel):
     fallback: bool = False
     sessionId: str | None = None
     turnId: str | None = None
+    agentTrace: AgentTrace | None = None
 
 
 class HistorySessionSummary(BaseModel):

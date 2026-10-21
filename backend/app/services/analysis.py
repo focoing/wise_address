@@ -17,9 +17,10 @@ def build_analysis(request: AnalysisRequest, poi_summary: PoiSummary) -> Analysi
     actions = _actions(request.module, score)
     risks = _risks(request, dimensions)
     evidence = _evidence(request, poi_summary, dimensions)
-    charts = _charts(dimensions, poi_summary)
+    charts = _charts(request, dimensions, poi_summary)
     recommendation = _recommendation(request, score, dimensions)
     alternatives = _alternatives(request, score, dimensions)
+    module_findings = _module_findings(request, poi_summary, dimensions)
     return AnalysisResponse(
         module=request.module,
         score=max(0, min(100, score)),
@@ -30,8 +31,9 @@ def build_analysis(request: AnalysisRequest, poi_summary: PoiSummary) -> Analysi
         actions=actions,
         risks=risks,
         evidence=evidence,
-        estimatedFields=["客流强度", "租金压力", "消费潜力", "竞品压力"],
+        estimatedFields=["客流强度", "租金健康", "消费潜力", "竞品压力"],
         alternatives=alternatives,
+        moduleFindings=module_findings,
     )
 
 
@@ -86,13 +88,16 @@ def _business_match(business_type: str, categories: dict[str, int], flow: int, e
     return _clamp(base)
 
 
-def _charts(dimensions: dict[str, int], poi_summary: PoiSummary) -> dict[str, object]:
+def _charts(request: AnalysisRequest, dimensions: dict[str, int], poi_summary: PoiSummary) -> dict[str, object]:
     category_names = list(poi_summary.byCategory.keys())
     category_values = list(poi_summary.byCategory.values())
-    return {
-        "radar": [{"name": key, "value": value} for key, value in dimensions.items()],
-        "poiBars": {"labels": category_names, "values": category_values},
-        "potentialTrend": {
+    if request.module == AnalysisModule.regional_potential and len(poi_summary.samplePoints) >= 3:
+        trend = {
+            "labels": [point.label or f"点位{index + 1}" for index, point in enumerate(poi_summary.samplePoints)],
+            "values": [point.total for point in poi_summary.samplePoints],
+        }
+    else:
+        trend = {
             "labels": ["当前", "3个月", "6个月", "12个月"],
             "values": [
                 dimensions["消费潜力"],
@@ -100,7 +105,11 @@ def _charts(dimensions: dict[str, int], poi_summary: PoiSummary) -> dict[str, ob
                 _clamp(dimensions["消费潜力"] + 8),
                 _clamp(dimensions["消费潜力"] + 12),
             ],
-        },
+        }
+    return {
+        "radar": [{"name": key, "value": value} for key, value in dimensions.items()],
+        "poiBars": {"labels": category_names, "values": category_values},
+        "potentialTrend": trend,
         "ecosystem": {"labels": category_names, "values": category_values},
     }
 
@@ -110,12 +119,36 @@ def _recommendation(request: AnalysisRequest, score: int, dimensions: dict[str, 
     address = request.location.address or f"{request.location.lng},{request.location.lat}"
     strongest = max(dimensions, key=dimensions.get)
     weakest = min(dimensions, key=dimensions.get)
+    module_verdicts = {
+        AnalysisModule.site_selection: {
+            78: "建议优先进入尽调与租约谈判阶段",
+            62: "具备试点价值，但需要通过业态和租金条件控制风险",
+        },
+        AnalysisModule.store_diagnosis: {
+            78: "门店基础条件扎实，优先围绕诊断结论做精细化提升",
+            62: "门店具备提升空间，按诊断出的问题优先级排期整改",
+        },
+        AnalysisModule.ecosystem_planning: {
+            78: "区域业态结构成熟均衡，可按补位方向推进招商组合",
+            62: "结构基本健康但存在可补位缺口，招商需控制同质化",
+        },
+        AnalysisModule.regional_potential: {
+            78: "区域潜力稳定，可按分阶段策略进入",
+            62: "潜力中等，建议小规模试点验证后再决定扩张",
+        },
+    }
+    thresholds = module_verdicts[request.module]
     if score >= 78:
-        verdict = "建议优先进入尽调与租约谈判阶段"
+        verdict = thresholds[78]
     elif score >= 62:
-        verdict = "具备试点价值，但需要通过业态和租金条件控制风险"
+        verdict = thresholds[62]
     else:
-        verdict = "不建议直接落位，应先寻找替代点位或调整经营模型"
+        verdict = {
+            AnalysisModule.site_selection: "不建议直接落位，应先寻找替代点位或调整经营模型",
+            AnalysisModule.store_diagnosis: "门店面临结构性压力，需先解决核心问题再考虑追加投入",
+            AnalysisModule.ecosystem_planning: "业态结构失衡或覆盖不足，优先补齐核心缺口再谈组合优化",
+            AnalysisModule.regional_potential: "当前潜力偏弱，建议持续观察或转向更均衡区域",
+        }[request.module]
     return f"{module_name}结果：{address} 综合得分 {score}。{verdict}。主要优势是{strongest}，主要短板是{weakest}。"
 
 
@@ -256,3 +289,113 @@ def _alternatives(request: AnalysisRequest, score: int, dimensions: dict[str, in
 
 def _clamp(value: int | float, low: int = 0, high: int = 100) -> int:
     return max(low, min(high, int(round(value))))
+
+
+def _module_findings(request: AnalysisRequest, poi_summary: PoiSummary, dimensions: dict[str, int]) -> dict[str, object] | None:
+    if request.module == AnalysisModule.ecosystem_planning:
+        return _ecosystem_findings(poi_summary)
+    if request.module == AnalysisModule.store_diagnosis:
+        return _diagnosis_findings(request, dimensions)
+    if request.module == AnalysisModule.regional_potential:
+        return _region_findings(poi_summary)
+    return None
+
+
+def _ecosystem_findings(poi_summary: PoiSummary) -> dict[str, object]:
+    total = poi_summary.total
+    categories = poi_summary.byCategory
+    core = ["餐饮", "零售", "交通", "办公", "社区生活"]
+    gaps = [category for category in core if categories.get(category, 0) == 0]
+    saturated = [
+        {"category": category, "count": count, "share": round(count / total, 2)}
+        for category, count in sorted(categories.items(), key=lambda item: -item[1])
+        if total and count / total >= 0.45
+    ]
+    diversity = len([count for count in categories.values() if count > 0])
+    shares = (
+        {category: round(count / total, 2) for category, count in sorted(categories.items(), key=lambda item: -item[1])}
+        if total
+        else {}
+    )
+    return {
+        "ecosystem": {
+            "gaps": gaps,
+            "saturated": saturated,
+            "diversity": diversity,
+            "categoryShare": shares,
+        }
+    }
+
+
+def _diagnosis_findings(request: AnalysisRequest, dimensions: dict[str, int]) -> dict[str, object]:
+    metrics = request.storeMetrics
+    if not metrics:
+        return {"diagnosis": {"problems": ["经营数据不足"], "signals": []}}
+    problems = []
+    signals = []
+    rent_ratio = None
+    if metrics.monthlyRevenue and metrics.monthlyRent:
+        rent_ratio = metrics.monthlyRent / max(metrics.monthlyRevenue, 1)
+        signals.append(f"租金占营收比 {round(rent_ratio * 100, 1)}%")
+        if rent_ratio > 0.25:
+            problems.append("成本结构问题（租金占比过高）")
+    if metrics.conversionRate is not None:
+        signals.append(f"到店转化率 {round(metrics.conversionRate * 100, 1)}%")
+    if metrics.dailyOrders:
+        signals.append(f"日均订单 {metrics.dailyOrders}")
+    if dimensions["客流强度"] < 55 and dimensions["交通便利"] < 55:
+        problems.append("位置客流问题（区域人流与到达性双低）")
+    if dimensions["客流强度"] >= 60 and (
+        (metrics.conversionRate is not None and metrics.conversionRate < 0.10)
+        or (metrics.dailyOrders is not None and metrics.dailyOrders < dimensions["客流强度"] * 1.5)
+    ):
+        problems.append("到店转化问题（客流尚可但转化或订单偏低，指向门头、品类或价格带）")
+    if dimensions["竞品压力"] < 45:
+        problems.append("竞品挤压问题（周边同业态密度偏高）")
+    if not problems:
+        problems = ["未触发高危问题阈值，优先做常规优化"]
+    finding: dict[str, object] = {"problems": problems, "signals": signals}
+    if rent_ratio is not None:
+        finding["rentRatio"] = round(rent_ratio, 3)
+    return {"diagnosis": finding}
+
+
+def _region_findings(poi_summary: PoiSummary) -> dict[str, object]:
+    points = poi_summary.samplePoints
+    if len(points) < 3:
+        return {
+            "region": {
+                "samplePointCount": len(points),
+                "consistency": "数据不足",
+                "note": "多点采样不可用（数据智能体降级或未执行多点采样），仅基于中心点评估。",
+            }
+        }
+    totals = [point.total for point in points]
+    mean = sum(totals) / len(totals)
+    variance = sum((value - mean) ** 2 for value in totals) / len(totals)
+    std = variance ** 0.5
+    cv = std / mean if mean else 0.0
+    if cv <= 0.15:
+        consistency = "高（区域发展均衡，多点结构相似）"
+    elif cv <= 0.35:
+        consistency = "中（存在局部冷热差，点位选择敏感）"
+    else:
+        consistency = "低（发展不均衡，点位间差异显著）"
+    threshold = max(1, int(len(points) * 0.8))
+    present_counts: dict[str, int] = {}
+    for point in points:
+        for category in point.byCategory:
+            if point.byCategory[category] > 0:
+                present_counts[category] = present_counts.get(category, 0) + 1
+    widespread = [category for category, count in present_counts.items() if count >= threshold]
+    local = [category for category, count in present_counts.items() if count == 1]
+    return {
+        "region": {
+            "consistency": consistency,
+            "cv": round(cv, 3),
+            "pointTotals": [{"label": point.label or f"点位{index + 1}", "total": point.total} for index, point in enumerate(points)],
+            "widespreadCategories": widespread,
+            "localCategories": local,
+            "samplePointCount": len(points),
+        }
+    }

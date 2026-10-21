@@ -27,6 +27,7 @@ export async function streamAgent(
     onAnalysis: (data: Pick<AgentResponse, 'analysis' | 'usedModel'>) => void
     onDelta: (text: string) => void
     onDone: (data: Omit<AgentResponse, 'analysis'>) => void
+    onStage?: (data: { stage: string; label: string }) => void
   }
 ): Promise<void> {
   const response = await fetch('/api/agent/chat/stream', {
@@ -63,6 +64,7 @@ function handleSseEvent(
     onAnalysis: (data: Pick<AgentResponse, 'analysis' | 'usedModel'>) => void
     onDelta: (text: string) => void
     onDone: (data: Omit<AgentResponse, 'analysis'>) => void
+    onStage?: (data: { stage: string; label: string }) => void
   }
 ) {
   const event = eventText
@@ -80,6 +82,7 @@ function handleSseEvent(
   if (event === 'analysis') handlers.onAnalysis(data)
   if (event === 'delta') handlers.onDelta(data.text || '')
   if (event === 'done') handlers.onDone(data)
+  if (event === 'stage') handlers.onStage?.(data)
 }
 
 export async function listHistorySessions(): Promise<HistorySessionSummary[]> {

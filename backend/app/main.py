@@ -1,3 +1,4 @@
+import asyncio
 import json
 import re
 from pathlib import Path
@@ -8,10 +9,10 @@ from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from app.config import Settings, get_settings
-from app.models import AgentResponse, AnalysisModule, AnalysisRequest, AnalysisResponse, HistorySessionDetail, HistorySessionSummary
+from app.models import AgentResponse, AgentTrace, AnalysisModule, AnalysisRequest, AnalysisResponse, HistorySessionDetail, HistorySessionSummary
+from app.services.agents import collect_pois_hardcoded, run_answer_pipeline, run_data_agent
 from app.services.amap import AmapClient
 from app.services.analysis import build_analysis
-from app.services.llm import ask_llm, stream_llm
 from app.services.history import delete_session, get_session_detail, init_history_db, list_sessions, save_agent_history
 
 
@@ -96,9 +97,15 @@ async def agent_chat(
     client: AmapClient = Depends(amap_client),
     settings: Settings = Depends(get_settings),
 ) -> AgentResponse:
-    analysis = await _run_analysis(request, client)
-    answer, fallback = await ask_llm(settings, request, analysis)
-    response = AgentResponse(answer=answer, analysis=analysis, usedModel=settings.llm_model, fallback=fallback)
+    analysis, trace = await _run_analysis_multi(settings, client, request)
+    answer, fallback = await run_answer_pipeline(settings, request, analysis, trace)
+    response = AgentResponse(
+        answer=answer,
+        analysis=analysis,
+        usedModel=settings.llm_model,
+        fallback=fallback,
+        agentTrace=trace,
+    )
     session_id, turn_id = save_agent_history(request, analysis, response)
     response.sessionId = session_id
     response.turnId = turn_id
@@ -112,29 +119,61 @@ async def agent_chat_stream(
     settings: Settings = Depends(get_settings),
 ) -> StreamingResponse:
     async def event_stream():
-        analysis = await _run_analysis(request, client)
-        yield _sse("analysis", {"analysis": analysis.model_dump(mode="json"), "usedModel": settings.llm_model})
+        queue: asyncio.Queue[tuple[str, dict] | None] = asyncio.Queue()
 
-        answer_parts: list[str] = []
-        fallback = False
-        async for chunk, chunk_fallback in stream_llm(settings, request, analysis):
-            fallback = fallback or chunk_fallback
-            answer_parts.append(chunk)
-            yield _sse("delta", {"text": chunk})
+        async def on_stage(stage: str, label: str) -> None:
+            await queue.put(("stage", {"stage": stage, "label": label}))
 
-        answer = "".join(answer_parts)
-        response = AgentResponse(answer=answer, analysis=analysis, usedModel=settings.llm_model, fallback=fallback)
-        session_id, turn_id = save_agent_history(request, analysis, response)
-        yield _sse(
-            "done",
-            {
-                "answer": answer,
-                "fallback": fallback,
-                "usedModel": settings.llm_model,
-                "sessionId": session_id,
-                "turnId": turn_id,
-            },
-        )
+        async def pipeline() -> None:
+            try:
+                await queue.put(("stage", {"stage": "data_agent", "label": "数据智能体检索周边 POI"}))
+                analysis, trace = await _run_analysis_multi(settings, client, request)
+                await queue.put(
+                    (
+                        "analysis",
+                        {
+                            "analysis": analysis.model_dump(mode="json"),
+                            "usedModel": settings.llm_model,
+                            "agentTrace": trace.model_dump(),
+                        },
+                    )
+                )
+                answer, fallback = await run_answer_pipeline(settings, request, analysis, trace, on_stage=on_stage)
+                await queue.put(("stage", {"stage": "final", "label": "汇总最终报告"}))
+                for i in range(0, len(answer), 24):
+                    await queue.put(("delta", {"text": answer[i : i + 24]}))
+                    await asyncio.sleep(0.03)
+                response = AgentResponse(
+                    answer=answer,
+                    analysis=analysis,
+                    usedModel=settings.llm_model,
+                    fallback=fallback,
+                    agentTrace=trace,
+                )
+                session_id, turn_id = save_agent_history(request, analysis, response)
+                await queue.put(
+                    (
+                        "done",
+                        {
+                            "answer": answer,
+                            "fallback": fallback,
+                            "usedModel": settings.llm_model,
+                            "sessionId": session_id,
+                            "turnId": turn_id,
+                            "agentTrace": trace.model_dump(),
+                        },
+                    )
+                )
+            finally:
+                await queue.put(None)
+
+        task = asyncio.create_task(pipeline())
+        while True:
+            item = await queue.get()
+            if item is None:
+                break
+            yield _sse(item[0], item[1])
+        await task
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")
 
@@ -154,7 +193,7 @@ async def history_session_delete(session_id: str) -> dict[str, str]:
     return delete_session(session_id)
 
 
-async def _run_analysis(request: AnalysisRequest, client: AmapClient) -> AnalysisResponse:
+async def _prepare_request(request: AnalysisRequest, client: AmapClient) -> None:
     request.scenario.businessType = request.scenario.businessType.strip()
     if not request.scenario.businessType:
         request.scenario.businessType = _infer_business_type(request.question)
@@ -164,24 +203,31 @@ async def _run_analysis(request: AnalysisRequest, client: AmapClient) -> Analysi
         request.location.address = str(geo.get("address") or "")
         request.location.district = str(geo.get("district") or "")
 
-    poi_summary = await client.nearby_pois(
-        request.location.lng,
-        request.location.lat,
-        request.scenario.radius,
-        pages=2,
-    )
-    if request.scenario.businessType:
-        try:
-            competitors = await client.nearby_pois(
-                request.location.lng,
-                request.location.lat,
-                request.scenario.radius,
-                keywords=request.scenario.businessType,
-            )
-            poi_summary.competitorCount = competitors.total
-        except Exception:
-            poi_summary.competitorCount = 0
+
+async def _run_analysis(request: AnalysisRequest, client: AmapClient) -> AnalysisResponse:
+    """快速确定性路径：固定检索策略 + 规则引擎（/api/analysis/* 端点使用）。"""
+    await _prepare_request(request, client)
+    poi_summary = await collect_pois_hardcoded(request, client)
     return build_analysis(request, poi_summary)
+
+
+async def _run_analysis_multi(
+    settings: Settings,
+    client: AmapClient,
+    request: AnalysisRequest,
+) -> tuple[AnalysisResponse, AgentTrace]:
+    """多智能体路径：数据智能体决定检索策略，失败自动降级为固定策略。"""
+    await _prepare_request(request, client)
+    trace = AgentTrace()
+    poi_summary, notes, ok = await run_data_agent(settings, client, request)
+    if ok and poi_summary is not None:
+        trace.dataAgent = "ok"
+        trace.retrievalNotes = notes
+    else:
+        poi_summary = await collect_pois_hardcoded(request, client)
+        trace.dataAgent = "fallback"
+        trace.retrievalNotes = "数据智能体不可用，已降级为固定检索策略。"
+    return build_analysis(request, poi_summary), trace
 
 
 BUSINESS_LEXICON: dict[str, tuple[str, ...]] = {
